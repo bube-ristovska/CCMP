@@ -1,0 +1,353 @@
+package CCMP_encryption;
+
+import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.SecretKeySpec;
+
+class AES {
+
+    private static SecretKeySpec secretKey;
+    private static byte[] key;
+
+    public static void setKey(String myKey) {
+        MessageDigest sha = null;
+        try {
+            key = myKey.getBytes("UTF-8");
+            sha = MessageDigest.getInstance("SHA-256");
+            key = sha.digest(key);
+            key = Arrays.copyOf(key, 16);
+            secretKey = new SecretKeySpec(key, "AES");
+        } catch (NoSuchAlgorithmException e) {
+            e.printStackTrace();
+        } catch (UnsupportedEncodingException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static byte[] encrypt(byte[] strToEncrypt, String secret) {
+        try {
+            setKey(secret);
+            Cipher cipher = Cipher.getInstance("AES/ECB/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey);
+            return cipher.doFinal(strToEncrypt);
+        } catch (Exception e) {
+            System.out.println("Error while encrypting: " + e.toString());
+        }
+        return null;
+    }
+
+    public static byte[] decrypt(byte[] strToDecrypt, String secret) {
+        try {
+            setKey(secret);
+            Cipher cipher = Cipher.getInstance("AES/ECB/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, secretKey);
+            return cipher.doFinal(strToDecrypt);
+        } catch (Exception e) {
+            System.out.println("Error while decrypting: " + e.toString());
+        }
+        return null;
+    }
+}
+
+class FrameHeader {
+    String destMacAddr;
+    String sourceMacAddr;
+    String etherType = "IP"; // what kind of data contains e.g. ARP, IP ...
+
+    public FrameHeader(String destMacAddr, String sourceMacAddr) {
+        this.destMacAddr = destMacAddr;
+        this.sourceMacAddr = sourceMacAddr;
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Source MAC = ").append(sourceMacAddr).append('\n')
+                .append("Destination MAC = ").append(destMacAddr).append('\n')
+                .append("EtherType = ").append(etherType);
+        return sb.toString();
+    }
+}
+
+class Frame {
+    final long PN = 0x36CCCD8CCD8CL; // 48-bit packet number(PN)
+    FrameHeader frameHeader;
+    byte[] MIC;
+    byte [] IV;
+
+    public Frame() {
+        this.frameHeader = new FrameHeader("00:1A:2B:3C:4D:5E", "12:1A:2B:3C:4D:5E");
+    }
+
+    public long getPacketNumber() {
+        return PN;
+    }
+    public long getSourceMac() {
+        String result = frameHeader.sourceMacAddr.replace(":", "");
+        return Long.parseLong(result, 16);
+    }
+    public static byte[] xorByteArrays(byte[] a, byte[] b) {
+        if (a.length != b.length) {
+            throw new IllegalArgumentException("Input arrays must have the same length.");
+        }
+
+        byte[] result = new byte[a.length];
+        for (int i = 0; i < a.length; i++) {
+            result[i] = (byte) (a[i] ^ b[i]);
+        }
+        return result;
+    }
+     void incrementCounter(byte[] counter) {
+        for (int i = counter.length - 1; i >= 0; i--) {
+            if (counter[i] == (byte) 0xFF) {
+                counter[i] = 0;
+            } else {
+                counter[i]++;
+                break;
+            }
+        }
+    }
+}
+
+class ClearTextFrame extends Frame {
+    String clearTextPayload;
+    List<byte[]> blocks = new ArrayList<>(); // the data with padding
+
+
+    public ClearTextFrame(String message, String secretKey) {
+        super();
+        this.blocks = paddingAndBlocks(message); // padding to the message
+        clearTextPayload = message;
+        calculateMIC(secretKey);
+    }
+
+
+    public void calculateMIC(String secretKey) {
+        long PN = getPacketNumber(); // 48 bits
+        long sourceMac = getSourceMac(); // 48 bits
+        long qosPriority = 4; // 8 bits
+
+        long nonceIV = (PN << 56) | (sourceMac << 8) | qosPriority;
+
+        byte[] result = AES.encrypt(Long.toHexString(nonceIV).getBytes(), secretKey);
+        this.IV = Long.toHexString(nonceIV).getBytes();
+
+        // chaining method MIC
+        for (byte[] block : blocks) {
+            result = xorByteArrays(block, result);
+            //System.out.println("XOR result:"+ByteArrayToHexString.bytesToHex(result));
+            result = AES.encrypt(result, secretKey);
+            //System.out.println("AES result:"  + ByteArrayToHexString.bytesToHex(result));
+
+        }
+        this.MIC = Arrays.copyOfRange(result, 0, 8);
+        // getting only the first 64 bits, the second half is calculated after
+    }
+
+
+
+    public static List<byte[]> paddingAndBlocks(String inputString) {
+        // simulation of PKCS#7 padding scheme
+        byte[] inputBytes = inputString.getBytes(StandardCharsets.UTF_8);
+        int blockSize = 16;
+        int paddingSize = blockSize - (inputBytes.length % blockSize);
+        byte[] paddedBytes = new byte[inputBytes.length + paddingSize];
+
+        System.arraycopy(inputBytes, 0, paddedBytes, 0, inputBytes.length);
+
+        Arrays.fill(paddedBytes, inputBytes.length, paddedBytes.length, (byte) paddingSize);
+        paddedBytes[paddedBytes.length - 1] = (byte) paddingSize;
+
+        List<byte[]> blocks = new ArrayList<>();
+        for (int i = 0; i < paddedBytes.length; i += blockSize) {
+            byte[] block = Arrays.copyOfRange(paddedBytes, i, i + blockSize);
+            blocks.add(block);
+        }
+        return blocks;
+    }
+
+
+
+    public EncryptedFrame encryptBlocksECB(String secretKey) {
+        List<byte[]> byteArrays = new ArrayList<>();
+
+        // Ctr Preload = PL + IV
+        byte[] PL = "000".getBytes();
+        byte [] ctrPreload = new byte[16];
+        System.arraycopy(IV, 0, ctrPreload, 0, 13);
+        System.arraycopy(PL, 0, ctrPreload, 13, 3);
+
+        // To finalize MIC we needed this preload(0)
+        byte[] mostSigBytesAESctr = new byte[8];
+        System.arraycopy(AES.encrypt(ctrPreload, secretKey), 0, mostSigBytesAESctr, 0, 8);
+        byte[] finalMic = xorByteArrays(mostSigBytesAESctr, this.MIC);
+
+        incrementCounter(ctrPreload);
+
+        for (byte[] block : blocks) {
+            // System.out.println("PL:" + ByteArrayToHexString.bytesToHex(ctrPreload));
+            byte[] aesResult = AES.encrypt(ctrPreload, secretKey);
+            byte[] data = xorByteArrays(block, aesResult);
+            byteArrays.add(data);
+            incrementCounter(ctrPreload);
+        }
+
+        // concat
+        int totalLength = byteArrays.stream().mapToInt(arr -> arr.length).sum();
+        int offset = 0;
+        byte[] result = new byte[totalLength];
+        for (byte[] array : byteArrays) {
+            System.arraycopy(array, 0, result, offset, array.length);
+            offset += array.length;
+        }
+
+        EncryptedFrame ef = new EncryptedFrame();
+        ef.frameHeader = frameHeader;
+        ef.dataEncrypted = ByteArrayToHexString.bytesToHex(result);
+        ef.MIC = finalMic;
+        ef.blocksEncrypted = byteArrays;
+        ef.IV = IV;
+        return ef;
+    }
+
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Clear Text Frame").append('\n');
+        sb.append("Frame header:").append('\n').append(frameHeader).append('\n');
+        sb.append("PN=").append(PN).append('\n');
+        sb.append("HalfMIC 64 bits:").append(ByteArrayToHexString.bytesToHex(MIC)).append('\n');
+        sb.append("Data:").append(clearTextPayload).append('\n');
+
+        return sb.toString();
+    }
+}
+
+class ByteArrayToHexString {
+    public static String bytesToHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : bytes) {
+            hexString.append(String.format("%02X", b)); // Convert each byte to a two-character hexadecimal representation
+        }
+        return hexString.toString();
+    }
+}
+
+
+class EncryptedFrame extends Frame {
+    String dataEncrypted;
+    List<byte[]> blocksEncrypted = new ArrayList<>(); // the data with padding
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Encrypted Text Frame").append('\n');
+        sb.append("Frame header is the same:").append('\n').append(frameHeader).append('\n');
+        sb.append("PN also the same").append(PN).append('\n');
+        sb.append("Final MIC:").append(ByteArrayToHexString.bytesToHex(MIC)).append('\n');
+        sb.append("Data encrypted:").append(dataEncrypted).append('\n');
+
+        return sb.toString();
+    }
+
+    public static String removePaddingAndCombine(List<byte[]> blocks) {
+        int blockSize = 16;
+        byte[] combinedBytes = new byte[blocks.size() * blockSize];
+        int index = 0;
+
+        for (byte[] block : blocks) {
+            System.arraycopy(block, 0, combinedBytes, index, blockSize);
+            index += blockSize;
+        }
+
+        int paddingSize = combinedBytes[combinedBytes.length - 1];
+
+        byte[] originalBytes = new byte[combinedBytes.length - paddingSize];
+        System.arraycopy(combinedBytes, 0, originalBytes, 0, originalBytes.length);
+
+        return new String(originalBytes, StandardCharsets.UTF_8);
+    }
+
+
+    public boolean checkAuthenticity(String secretKey) {
+        List<byte[]> byteArrays = new ArrayList<>();
+
+        // Ctr Preload = PL + IV
+        byte[] PL = "000".getBytes();
+        byte [] ctrPreload = new byte[16];
+        System.arraycopy(IV, 0, ctrPreload, 0, 13);
+        System.arraycopy(PL, 0, ctrPreload, 13, 3);
+
+        incrementCounter(ctrPreload);
+        // decrypting blocks
+        for (byte[] block : blocksEncrypted) {
+            System.out.println("Encrypted block:" + new String(block, StandardCharsets.UTF_8));
+            // System.out.println("PL:" + ByteArrayToHexString.bytesToHex(ctrPreload));
+            byte[] aesResult = AES.encrypt(ctrPreload, secretKey);
+            byte[] data = xorByteArrays(block, aesResult);
+            byteArrays.add(data);
+        }
+
+        removePaddingAndCombine(byteArrays);
+        List<String> utfStrings = new ArrayList<>();
+        for (byte[] byteArray : byteArrays) {
+            String utfString = new String(byteArray, StandardCharsets.UTF_8);
+            utfStrings.add(utfString);
+        }
+
+        System.out.println("==============The decrypted message with padding is==============");
+        utfStrings.forEach(System.out::println);
+        System.out.println("==============Creating MIC and checking it==============");
+        
+
+
+        return true;
+    }
+}
+
+public class Main {
+
+    public static String bytesToHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder(2 * bytes.length);
+        for (byte b : bytes) {
+            hexString.append(String.format("%02X", b));
+        }
+        return hexString.toString();
+    }
+
+    public static String generateSecretKey() {
+        byte[] array = new byte[16]; // 128 bit
+        new Random().nextBytes(array);
+        String secretKeyHex = bytesToHex(array);
+        //System.out.printf("Your secret key in HEX is:" + secretKeyHex + "\n");
+        return secretKeyHex;
+    }
+
+
+    public static void main(String[] args) throws UnsupportedEncodingException {
+        Scanner sc = new Scanner(System.in);
+        final String secretKey = generateSecretKey();
+        System.out.println("Enter the data you want to send:");
+        String message;
+        message = sc.nextLine();
+        sc.close();
+
+        ClearTextFrame frame = new ClearTextFrame(message, secretKey);
+        EncryptedFrame encryptedFrame = frame.encryptBlocksECB(secretKey);
+
+        System.out.println(frame);
+        System.out.println("=============Let's encrypt it and send it==============");
+        System.out.println(encryptedFrame);
+        System.out.println("==============It's sending please wait........=============");
+        boolean flag = encryptedFrame.checkAuthenticity(secretKey);
+
+
+        // XOR na cypher
+    }
+}
